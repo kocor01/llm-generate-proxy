@@ -19,6 +19,7 @@
 
 - [工作原理](#-工作原理)
 - [支持的 API 平台](#-支持的-api-平台)
+- [应用场景](#-应用场景)
 - [快速开始](#-快速开始)
 - [使用示例](#-使用示例)
 - [配置说明](#-配置说明)
@@ -87,6 +88,162 @@ Client App (OpenAI SDK / 其他客户端)
 例如：
 - OpenAI: `http://127.0.0.1:8080/openai/v1/chat/completions`
 - 阿里云百炼: `http://127.0.0.1:8080/dashscope-openai/v1/chat/completions`
+
+### 添加新的 API 平台
+
+编辑 [`main.py`](main.py) 中的 `API_MAPPING` 字典：
+
+```python
+API_MAPPING = {
+    "openai": "https://api.openai.com",
+    "anthropic": "https://api.anthropic.com",
+    "deepseek": "https://api.deepseek.com",
+    "dashscope-openai": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "dashscope-anthropic": "https://dashscope.aliyuncs.com/apps/anthropic",
+    # 添加新的平台
+    "your-platform": "https://your-api-endpoint.com",
+}
+```
+
+## 🎯 应用场景
+
+本代理服务器可与多种 AI 开发工具集成使用，以下是常见应用场景：
+
+### 1. Claude Code CLI
+
+[Claude Code](https://docs.anthropic.com/claude-code) 是 Anthropic 官方推出的命令行 AI 编程助手。通过本代理，您可以：
+
+- **统一 API 管理**：集中管理多个 Claude API Key
+- **完整日志记录**：自动记录所有 Claude Code 的对话和代码生成过程
+- **灵活路由**：轻松切换不同的 Claude 模型或 API 提供商
+
+**配置步骤：**
+
+```bash
+# 1. 启动代理服务器
+uv run python main.py
+
+# 2. 配置 Claude Code 使用本地代理
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080/anthropic"
+export ANTHROPIC_API_KEY="your-api-key"
+
+# 3. 使用 Claude Code
+claude "帮我创建一个 Python Flask 应用"
+```
+
+**优势：**
+- ✅ 所有 Claude Code 的请求都会被记录到 `proxy_requests.log`
+- ✅ 便于审计和回溯对话历史
+- ✅ 可以在团队中共享同一个代理，统一管理 API Key
+
+### 2. ccswitch (Claude Code Switch)
+
+[ccswitch](https://github.com/your-repo/ccswitch) 是一个用于在多个 Claude API 端点之间切换的工具。配合本代理使用可以实现：
+
+- **多账号负载均衡**：在多个 API Key 之间自动切换
+- **故障转移**：当某个 API 不可用时自动切换到备用端点
+- **成本优化**：根据不同场景选择最经济的 API 提供商
+
+**配置示例：**
+
+```python
+# ccswitch 配置文件
+{
+    "endpoints": [
+        {
+            "name": "primary",
+            "base_url": "http://127.0.0.1:8080/anthropic",
+            "api_key": "sk-ant-primary"
+        },
+        {
+            "name": "backup",
+            "base_url": "http://127.0.0.1:8080/dashscope-anthropic",
+            "api_key": "sk-dashscope-backup"
+        }
+    ],
+    "strategy": "round-robin"  # 或 "failover"
+}
+```
+
+**工作流程：**
+```
+ccswitch → LLM Generate Proxy → 上游 API
+              ↓
+         记录完整日志
+```
+
+### 3. 其他 AI 开发工具
+
+本代理还可以与以下工具集成：
+
+#### Cursor / VSCode AI 插件
+```json
+// .cursorrules 或 VSCode 设置
+{
+  "openai.baseURL": "http://127.0.0.1:8080/openai",
+  "anthropic.baseURL": "http://127.0.0.1:8080/anthropic"
+}
+```
+
+#### Continue.dev
+```json
+// config.json
+{
+  "models": [
+    {
+      "title": "Claude via Proxy",
+      "provider": "anthropic",
+      "model": "claude-3-sonnet-20240229",
+      "apiKey": "your-key",
+      "apiBase": "http://127.0.0.1:8080/anthropic"
+    }
+  ]
+}
+```
+
+#### Aider (AI Pair Programming)
+```bash
+# 使用代理运行 aider
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8080/anthropic"
+aider --model claude-3-sonnet-20240229
+```
+
+### 4. 团队协作场景
+
+在团队开发环境中，本代理可以发挥更大价值：
+
+**架构示意：**
+```
+开发者 A ──┐
+开发者 B ──┼──→ LLM Generate Proxy ──→ 上游 API
+开发者 C ──┘         ↓
+                  统一日志中心
+```
+
+**优势：**
+- 📊 **用量统计**：基于日志分析每个开发者的 API 使用情况
+- 🔒 **权限控制**：集中管理 API Key，避免泄露
+- 💰 **成本控制**：监控和优化 API 调用成本
+- 📝 **知识沉淀**：保存所有对话记录，形成团队知识库
+
+### 5. 自定义工作流
+
+您可以基于代理日志构建自定义工作流：
+
+```python
+# 示例：从日志中提取代码片段
+import json
+
+with open('proxy_requests.log', 'r') as f:
+    for line in f:
+        log_entry = json.loads(line)
+        if log_entry['response']['status_code'] == 200:
+            # 提取生成的代码
+            response_body = log_entry['response']['body']
+            # 处理代码片段...
+```
+
+---
 
 ## 🚀 快速开始
 
@@ -170,7 +327,7 @@ uv run python main.py --port 9000 --log-file custom.log
 
 ### 示例 1：使用 OpenAI SDK 调用阿里云百炼
 
-```python
+```
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -196,7 +353,7 @@ print(completion.choices[0].message.content)
 
 ### 示例 2：流式响应
 
-```python
+```
 stream = client.chat.completions.create(
     model="qwen-plus-latest",
     messages=[{"role": "user", "content": "介绍下你自己"}],
@@ -210,7 +367,7 @@ for chunk in stream:
 
 ### 示例 3：调用 OpenAI API
 
-```python
+```
 from openai import OpenAI
 
 client = OpenAI(
@@ -227,7 +384,7 @@ print(completion.choices[0].message.content)
 
 ### 示例 4：调用 Anthropic API
 
-```python
+```
 import anthropic
 
 client = anthropic.Anthropic(
@@ -245,7 +402,7 @@ print(message.content[0].text)
 
 ### 示例 5：直接使用 HTTP 请求
 
-```python
+```
 import requests
 import json
 
@@ -273,22 +430,6 @@ print(response.json())
 | `--port` | `8080` | 代理服务器监听端口 |
 | `--log-file` | `proxy_requests.log` | 日志文件路径 |
 
-### 添加新的 API 平台
-
-编辑 [`main.py`](main.py) 中的 `API_MAPPING` 字典：
-
-```python
-API_MAPPING = {
-    "openai": "https://api.openai.com",
-    "anthropic": "https://api.anthropic.com",
-    "deepseek": "https://api.deepseek.com",
-    "dashscope-openai": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "dashscope-anthropic": "https://dashscope.aliyuncs.com/apps/anthropic",
-    # 添加新的平台
-    "your-platform": "https://your-api-endpoint.com",
-}
-```
-
 ### 超时配置
 
 修改 `REQUEST_TIMEOUT` 常量（默认 300 秒）：
@@ -303,7 +444,7 @@ REQUEST_TIMEOUT = 300  # 单位：秒
 
 ### 非流式响应日志示例
 
-```json
+```
 {
   "timestamp": "2026-04-28T19:00:00",
   "request": {
@@ -331,7 +472,7 @@ REQUEST_TIMEOUT = 300  # 单位：秒
 
 ### 流式响应日志示例
 
-```json
+```
 {
   "timestamp": "2026-04-28T19:00:00",
   "request": { ... },
