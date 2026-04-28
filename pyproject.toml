@@ -1,0 +1,12 @@
+[project]
+name = "llm-generate-proxy"
+version = "0.1.0"
+description = "通用大模型 API 转发代理 - 简化版"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "aiohttp>=3.13.5",
+]
+
+[project.scripts]
+proxy = "main:main"
