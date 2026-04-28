@@ -18,7 +18,8 @@ API_MAPPING = {
     "openai": "https://api.openai.com",
     "anthropic": "https://api.anthropic.com",
     "deepseek": "https://api.deepseek.com",
-    "dashscope": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "dashscope-openai": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "dashscope-anthropic": "https://dashscope.aliyuncs.com/apps/anthropic",
 }
 
 DEFAULT_PORT = 8080
@@ -139,42 +140,83 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         status=upstream_resp.status,
                         headers=resp_headers,
                     )
-                    await resp.prepare(request)
                     
-                    # 缓冲区收集完整响应用于日志
-                    full_response_buffer = bytearray()
-                    
-                    async for chunk, _ in upstream_resp.content.iter_chunks():
-                        full_response_buffer.extend(chunk)
-                        await resp.write(chunk)
-                    
-                    await resp.write_eof()
-                    
-                    elapsed = time.time() - start_time
-                    
-                    # 记录完整日志（流式响应）
-                    log_entry = {
-                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                        "request": {
-                            "method": method,
-                            "path": original_path,
-                            "upstream_url": upstream_url,
-                            "headers": dict(headers),
-                            "body": body.decode("utf-8", errors="replace") if body else ""
-                        },
-                        "response": {
-                            "status_code": upstream_resp.status,
-                            "elapsed_seconds": round(elapsed, 3),
-                            "headers": dict(upstream_resp.headers),
-                            "body": bytes(full_response_buffer).decode("utf-8", errors="replace"),
-                            "is_streaming": True
+                    try:
+                        await resp.prepare(request)
+                        
+                        # 缓冲区收集完整响应用于日志
+                        full_response_buffer = bytearray()
+                        
+                        async for chunk, _ in upstream_resp.content.iter_chunks():
+                            full_response_buffer.extend(chunk)
+                            try:
+                                await resp.write(chunk)
+                            except (ConnectionResetError, BrokenPipeError, ConnectionError) as write_err:
+                                # 客户端连接已关闭，停止写入但继续读取上游数据用于日志
+                                if logger:
+                                    logger.warning(f"客户端连接中断: {write_err}")
+                                break
+                        
+                        try:
+                            await resp.write_eof()
+                        except (ConnectionResetError, BrokenPipeError, ConnectionError):
+                            # 忽略关闭时的连接错误
+                            pass
+                        
+                        elapsed = time.time() - start_time
+                        
+                        # 记录完整日志（流式响应）
+                        log_entry = {
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "request": {
+                                "method": method,
+                                "path": original_path,
+                                "upstream_url": upstream_url,
+                                "headers": dict(headers),
+                                "body": body.decode("utf-8", errors="replace") if body else ""
+                            },
+                            "response": {
+                                "status_code": upstream_resp.status,
+                                "elapsed_seconds": round(elapsed, 3),
+                                "headers": dict(upstream_resp.headers),
+                                "body": bytes(full_response_buffer).decode("utf-8", errors="replace"),
+                                "is_streaming": True
+                            }
                         }
-                    }
+                        
+                        if logger:
+                            logger.info(json.dumps(log_entry, ensure_ascii=False))
+                        
+                        return resp
                     
-                    if logger:
-                        logger.info(json.dumps(log_entry, ensure_ascii=False))
-                    
-                    return resp
+                    except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
+                        # 准备响应时就失败（连接已关闭）
+                        elapsed = time.time() - start_time
+                        if logger:
+                            logger.warning(f"流式响应连接失败: {e}")
+                        
+                        error_log = {
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                            "request": {
+                                "method": method,
+                                "path": original_path,
+                                "upstream_url": upstream_url,
+                                "headers": dict(headers),
+                                "body": body.decode("utf-8", errors="replace") if body else ""
+                            },
+                            "response": {
+                                "status_code": upstream_resp.status,
+                                "elapsed_seconds": round(elapsed, 3),
+                                "error": f"Client connection closed: {str(e)}",
+                                "is_streaming": True
+                            }
+                        }
+                        if logger:
+                            logger.warning(json.dumps(error_log, ensure_ascii=False))
+                        
+                        # 即使连接失败，也要返回一个响应对象
+                        raise web.HTTPBadRequest(text="Client disconnected")
+
                 else:
                     # 非流式响应处理
                     resp_body = await upstream_resp.read()

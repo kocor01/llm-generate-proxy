@@ -20,22 +20,14 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
-.venv/
+# Virtual environments
+.env
+.venv
+env/
 venv/
 ENV/
-
-# uv
-uv.lock
-
-# Environment variables
-.env
-.env.*
-!.env.example
-
-# Logs
-*.log
-proxy_requests.log
+env.bak/
+venv.bak/
 
 # IDE
 .vscode/
@@ -47,3 +39,18 @@ proxy_requests.log
 # OS
 .DS_Store
 Thumbs.db
+
+# Logs
+*.log
+proxy_requests.log
+
+# Environment files (keep .env.example only)
+.env
+.env.local
+.env.production
+.env.development
+!.env.example
+
+# UV
+uv.lock
+.python-version
