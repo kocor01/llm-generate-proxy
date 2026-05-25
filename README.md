@@ -33,31 +33,73 @@
 ### 架构图
 
 ```
-Client App (OpenAI SDK / 其他客户端)
+Client App (OpenAI SDK / Anthropic SDK / 其他客户端)
     ↓
-┌─────────────────────────────────────┐
-│   LLM Generate Proxy (端口 8080)     │
-│                                     │
-│  1. 解析路径前缀 → 确定上游平台       │
-│  2. 转发请求到对应的上游 API          │
-│  3. 记录完整请求/响应日志             │
-│  4. 返回响应给客户端                  │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│   LLM Generate Proxy (端口 8881)                  │
+│                                                  │
+│  1. 解析路径前缀 → 确定上游平台                    │
+│  2. 转发请求到对应的上游 API                       │
+│  3. 流式响应适配器自动识别格式                      │
+│  4. 聚合流式数据为结构化日志                        │
+│  5. 实时转发响应给客户端                           │
+│  6. 记录完整请求/响应日志（单行JSON）               │
+└──────────────────────────────────────────────────┘
     ↓
-┌─────────────────────────────────────┐
-│   上游 API 平台                      │
-│   • OpenAI (api.openai.com)         │
-│   • Anthropic (api.anthropic.com)   │
-│   • DeepSeek (api.deepseek.com)     │
-│   • DashScope (阿里云百炼)           │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│   上游 API 平台                                    │
+│   • OpenAI (api.openai.com)                      │
+│   • Anthropic (api.anthropic.com)                │
+│   • DeepSeek (api.deepseek.com)                  │
+│   • DashScope (阿里云百炼)                        │
+└──────────────────────────────────────────────────┘
 ```
+
+### 核心特性
+
+#### 1. 透明转发
+
+代理自动处理请求和响应，客户端无需修改代码，只需更改 `base_url` 即可使用。
+
+#### 2. 流式响应适配器模式
+
+代理采用 **适配器模式** 处理不同 AI 平台的流式响应格式：
+
+- **OpenAI 适配器**：解析 OpenAI 格式的 SSE 流（`delta.content`, `delta.tool_calls`）
+- **Anthropic 适配器**：解析 Anthropic 格式的 SSE 流（`content_block_delta`, `input_json_delta`）
+- **通用适配器**：兜底处理未知格式
+
+所有适配器将不同格式的流数据统一转换为标准化结构：
+```python
+{
+    "content": "完整内容",
+    "reasoning_content": "推理内容",
+    "tool_calls": [...],
+    "finish_reason": "stop/tool_calls/length",
+    "usage": {"prompt_tokens": 50, "completion_tokens": 100}
+}
+```
+
+#### 3. 智能 JSON 解析
+
+- **请求体**：自动尝试解析为 JSON 对象
+- **响应体**：自动尝试解析为 JSON 对象
+- **工具调用参数**：`tool_calls[].function.arguments` 自动解析为 JSON 对象
+- **容错处理**：解析失败时保留原始字符串
+
+#### 4. 结构化日志
+
+流式响应的日志不再是原始 SSE 数据，而是聚合后的结构化内容：
+- 完整的内容文本（所有 chunk 聚合）
+- 工具调用列表（参数已解析为 JSON）
+- 性能指标（首字延迟、总耗时、chunk 数量等）
+- Token 使用统计
 
 ### 工作流程
 
 1. **客户端发起请求**：使用 OpenAI SDK 或其他 HTTP 客户端向代理发送请求
    ```
-   POST http://127.0.0.1:8080/dashscope-openai/v1/chat/completions
+   POST http://127.0.0.1:8881/dashscope-openai/v1/chat/completions
    ```
 
 2. **路径解析**：代理提取路径前缀（如 `dashscope-openai`），查找对应的上游 base_url
@@ -68,10 +110,13 @@ Client App (OpenAI SDK / 其他客户端)
    ```
 
 4. **响应处理**：
-   - **非流式响应**：等待完整响应后返回
-   - **流式响应**：实时转发每个 chunk，同时缓冲完整内容用于日志
+   - **非流式响应**：等待完整响应后返回，并记录完整响应体
+   - **流式响应**：
+     - 实时转发每个 chunk 给客户端
+     - 同时使用适配器解析并聚合流式数据
+     - 流结束后生成聚合后的结构化日志
 
-5. **日志记录**：以 JSON 格式记录完整的请求和响应信息到 `proxy_requests.log`
+5. **日志记录**：以 **单行 JSON** 格式记录完整的请求和响应信息到 `proxy_requests.log`
 
 ## 🌐 支持的 API 平台
 
@@ -86,8 +131,8 @@ Client App (OpenAI SDK / 其他客户端)
 **使用方式**：在客户端的 `base_url` 中添加对应的前缀即可。
 
 例如：
-- OpenAI: `http://127.0.0.1:8080/openai/v1/chat/completions`
-- 阿里云百炼: `http://127.0.0.1:8080/dashscope-openai/v1/chat/completions`
+- OpenAI: `http://127.0.0.1:8881/openai/v1/chat/completions`
+- 阿里云百炼: `http://127.0.0.1:8881/dashscope-openai/v1/chat/completions`
 
 ### 添加新的 API 平台
 
@@ -119,12 +164,12 @@ API_MAPPING = {
 
 **配置步骤：**
 
-```bash
+```
 # 1. 启动代理服务器
 uv run python main.py
 
 # 2. 配置 Claude Code 使用本地代理
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8080/anthropic"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8881/anthropic"
 export ANTHROPIC_API_KEY="your-api-key"
 
 # 3. 使用 Claude Code
@@ -146,18 +191,18 @@ claude "帮我创建一个 Python Flask 应用"
 
 **配置示例：**
 
-```python
+```
 # ccswitch 配置文件
 {
     "endpoints": [
         {
             "name": "primary",
-            "base_url": "http://127.0.0.1:8080/anthropic",
+            "base_url": "http://127.0.0.1:8881/anthropic",
             "api_key": "sk-ant-primary"
         },
         {
             "name": "backup",
-            "base_url": "http://127.0.0.1:8080/dashscope-anthropic",
+            "base_url": "http://127.0.0.1:8881/dashscope-anthropic",
             "api_key": "sk-dashscope-backup"
         }
     ],
@@ -180,8 +225,8 @@ ccswitch → LLM Generate Proxy → 上游 API
 ```json
 // .cursorrules 或 VSCode 设置
 {
-  "openai.baseURL": "http://127.0.0.1:8080/openai",
-  "anthropic.baseURL": "http://127.0.0.1:8080/anthropic"
+  "openai.baseURL": "http://127.0.0.1:8881/openai",
+  "anthropic.baseURL": "http://127.0.0.1:8881/anthropic"
 }
 ```
 
@@ -195,7 +240,7 @@ ccswitch → LLM Generate Proxy → 上游 API
       "provider": "anthropic",
       "model": "claude-3-sonnet-20240229",
       "apiKey": "your-key",
-      "apiBase": "http://127.0.0.1:8080/anthropic"
+      "apiBase": "http://127.0.0.1:8881/anthropic"
     }
   ]
 }
@@ -204,7 +249,7 @@ ccswitch → LLM Generate Proxy → 上游 API
 #### Aider (AI Pair Programming)
 ```bash
 # 使用代理运行 aider
-export ANTHROPIC_BASE_URL="http://127.0.0.1:8080/anthropic"
+export ANTHROPIC_BASE_URL="http://127.0.0.1:8881/anthropic"
 aider --model claude-3-sonnet-20240229
 ```
 
@@ -305,7 +350,7 @@ pip install aiohttp openai python-dotenv
 
 ### 启动代理服务器
 
-```bash
+```
 # 使用 uv 运行（推荐）
 uv run python main.py
 
@@ -318,7 +363,7 @@ uv run python main.py --port 9000 --log-file custom.log
 
 启动成功后会看到类似输出：
 ```
-2026-04-28 19:00:00 | 代理启动，监听 0.0.0.0:8080
+2026-04-28 19:00:00 | 代理启动，监听 0.0.0.0:8881
 2026-04-28 19:00:00 | 支持的 API 前缀: ['openai', 'anthropic', 'deepseek', 'dashscope-openai', 'dashscope-anthropic']
 2026-04-28 19:00:00 | 日志文件: proxy_requests.log
 ```
@@ -327,7 +372,7 @@ uv run python main.py --port 9000 --log-file custom.log
 
 ### 示例 1：使用 OpenAI SDK 调用阿里云百炼
 
-```
+```python
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -337,7 +382,7 @@ load_dotenv()
 
 client = OpenAI(
     api_key=os.getenv("DASHSCOPE_API_KEY"),
-    base_url="http://127.0.0.1:8080/dashscope-openai",  # 指向本地代理
+    base_url="http://127.0.0.1:8881/dashscope-openai",  # 指向本地代理
 )
 
 # 非流式对话
@@ -372,7 +417,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key=os.getenv("OPENAI_API_KEY"),
-    base_url="http://127.0.0.1:8080/openai",  # 使用 openai 前缀
+    base_url="http://127.0.0.1:8881/openai",  # 使用 openai 前缀
 )
 
 completion = client.chat.completions.create(
@@ -389,7 +434,7 @@ import anthropic
 
 client = anthropic.Anthropic(
     api_key=os.getenv("ANTHROPIC_API_KEY"),
-    base_url="http://127.0.0.1:8080/anthropic",  # 使用 anthropic 前缀
+    base_url="http://127.0.0.1:8881/anthropic",  # 使用 anthropic 前缀
 )
 
 message = client.messages.create(
@@ -407,7 +452,7 @@ import requests
 import json
 
 response = requests.post(
-    "http://127.0.0.1:8080/dashscope-openai/v1/chat/completions",
+    "http://127.0.0.1:8881/dashscope-openai/v1/chat/completions",
     headers={
         "Authorization": f"Bearer {os.getenv('DASHSCOPE_API_KEY')}",
         "Content-Type": "application/json",
@@ -427,7 +472,7 @@ print(response.json())
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--port` | `8080` | 代理服务器监听端口 |
+| `--port` | `8881` | 代理服务器监听端口 |
 | `--log-file` | `proxy_requests.log` | 日志文件路径 |
 
 ### 超时配置
@@ -440,67 +485,67 @@ REQUEST_TIMEOUT = 300  # 单位：秒
 
 ## 📝 日志格式
 
-代理会自动将所有请求和响应记录到日志文件（默认 `proxy_requests.log`），格式为 JSON：
+代理会自动将所有请求和响应记录到日志文件（默认 `proxy_requests.log`），格式为 **单行 JSON**：
 
 ### 非流式响应日志示例
 
 ```
-{
-  "timestamp": "2026-04-28T19:00:00",
-  "request": {
-    "method": "POST",
-    "path": "/dashscope-openai/v1/chat/completions",
-    "upstream_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "headers": {
-      "Authorization": "Bearer sk-xxx",
-      "Content-Type": "application/json"
-    },
-    "body": "{\"model\":\"qwen-plus-latest\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}]}"
-  },
-  "response": {
-    "status_code": 200,
-    "elapsed_seconds": 1.234,
-    "headers": {
-      "Content-Type": "application/json",
-      "X-Request-Id": "xxx"
-    },
-    "body": "{\"choices\":[{\"message\":{\"content\":\"你好！有什么可以帮助你的？\"}}]}",
-    "is_streaming": false
-  }
-}
+{"timestamp": "2026-04-28T19:00:00", "request": {"method": "POST", "path": "/dashscope-openai/v1/chat/completions", "upstream_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", "headers": {"Authorization": "Bearer sk-xxx", "Content-Type": "application/json"}, "body": {"model": "qwen-plus-latest", "messages": [{"role": "user", "content": "你好"}]}}, "response": {"status_code": 200, "elapsed_seconds": 1.234, "headers": {"Content-Type": "application/json", "X-Request-Id": "xxx"}, "body": {"id": "chatcmpl-xxx", "choices": [{"message": {"content": "你好！有什么可以帮助你的？"}}]}, "is_streaming": false}}
 ```
 
 ### 流式响应日志示例
 
 ```
-{
-  "timestamp": "2026-04-28T19:00:00",
-  "request": { ... },
-  "response": {
-    "status_code": 200,
-    "elapsed_seconds": 2.567,
-    "headers": { ... },
-    "body": "data: {...}\n\ndata: {...}\n\n...",
-    "is_streaming": true
-  }
-}
+{"timestamp": "2026-04-28T19:00:00", "request": {"method": "POST", "path": "/openai/v1/chat/completions", "upstream_url": "https://api.openai.com/v1/chat/completions", "headers": {"Authorization": "Bearer sk-xxx"}, "body": {"model": "gpt-4", "messages": [{"role": "user", "content": "你好"}], "stream": true}}, "response": {"status_code": 200, "elapsed_seconds": 2.567, "headers": {"Content-Type": "text/event-stream"}, "body": {"content": "你好！我是AI助手。", "reasoning_content": "", "tool_calls": [{"index": 0, "id": "call_abc123", "type": "function", "function": {"name": "get_weather", "arguments": {"location": "北京", "unit": "celsius"}}}], "finish_reason": "tool_calls", "usage": {"prompt_tokens": 50, "completion_tokens": 100, "total_tokens": 150}, "_meta": {"total_chunks": 15, "first_token_seconds": 0.234, "total_seconds": 2.567, "content_length": 18}}, "is_streaming": true}}
 ```
 
 ### 日志字段说明
 
+#### 请求部分 (request)
+
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `timestamp` | string | ISO 8601 格式时间戳 |
-| `request.method` | string | HTTP 方法 |
-| `request.path` | string | 原始请求路径 |
-| `request.upstream_url` | string | 转发到的上游 URL |
-| `request.headers` | object | 请求头（不含 Host） |
-| `request.body` | string | 请求体（UTF-8 解码） |
-| `response.status_code` | integer | 响应状态码 |
-| `response.elapsed_seconds` | float | 请求耗时（秒） |
-| `response.headers` | object | 响应头 |
-| `response.body` | string | 响应体（UTF-8 解码） |
-| `response.is_streaming` | boolean | 是否为流式响应 |
+| `method` | string | HTTP 方法（GET/POST 等） |
+| `path` | string | 原始请求路径 |
+| `upstream_url` | string | 转发到的上游 URL |
+| `headers` | object | 请求头（不含 Host） |
+| `body` | object/string | 请求体，**自动解析为 JSON 对象**（如果解析失败则保留原始字符串） |
+
+#### 响应部分 (response)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `status_code` | integer | 响应状态码 |
+| `elapsed_seconds` | float | 请求耗时（秒） |
+| `headers` | object | 响应头 |
+| `is_streaming` | boolean | 是否为流式响应 |
+
+**非流式响应 (`is_streaming: false`)**：
+- `body`: object/string - 响应体，**自动解析为 JSON 对象**（如果解析失败则保留原始字符串）
+
+**流式响应 (`is_streaming: true`)**：
+- `body`: object - 聚合后的结构化数据，包含以下字段：
+  - `content`: string - 完整的内容文本（所有 chunk 聚合）
+  - `reasoning_content`: string - 推理过程文本（如果支持）
+  - `tool_calls`: array - 工具调用列表，**其中 `arguments` 字段会自动解析为 JSON 对象**
+  - `finish_reason`: string - 完成原因（stop/tool_calls/length 等）
+  - `usage`: object - Token 使用统计
+  - `_meta`: object - 元数据指标：
+    - `total_chunks`: integer - 接收到的 chunk 总数
+    - `first_token_seconds`: float - 首字延迟（秒）
+    - `total_seconds`: float - 总耗时（秒）
+    - `content_length`: integer - 内容长度（字符数）
+
+### 日志特性
+
+1. **单行 JSON 格式**：所有日志条目均为单行格式，方便日志分析工具处理
+2. **智能 JSON 解析**：
+   - 请求体 (`request.body`) 自动尝试解析为 JSON
+   - 非流式响应体 (`response.body`) 自动尝试解析为 JSON
+   - 工具调用参数 (`response.body.tool_calls[].function.arguments`) 自动尝试解析为 JSON
+3. **流式响应聚合**：流式响应的多个 chunk 会被自动聚合成结构化数据
+4. **适配器自动识别**：通过 `AdapterRegistry` 自动识别 OpenAI、Anthropic 等不同格式的流式响应
+5. **异常容错**：所有 JSON 解析操作均包含异常处理，不会因格式错误导致流程中断
 
 ## ❓ 常见问题
 
@@ -630,7 +675,15 @@ llm-generate-proxy/
 
 - **路径解析**：[`extract_path_prefix()`](main.py) 和 [`build_upstream_url()`](main.py) 负责解析路径前缀并构建上游 URL
 - **请求处理**：[`handle_request()`](main.py) 是核心处理器，负责透明转发和日志记录
-- **流式处理**：自动检测流式响应并使用 `web.StreamResponse` 实时转发
+- **流式适配器**：
+  - [`StreamAdapter`](main.py) - 适配器基类，定义统一的解析和聚合接口
+  - [`OpenAIAdapter`](main.py) - 解析 OpenAI 格式的 SSE 流
+  - [`AnthropicAdapter`](main.py) - 解析 Anthropic 格式的 SSE 流
+  - [`GenericAdapter`](main.py) - 兜底处理未知格式
+  - [`AdapterRegistry`](main.py) - 自动识别并选择合适的适配器
+- **流式日志管道**：[`StreamingLogPipeline`](main.py) 负责实时解析 SSE 数据并聚合为结构化日志
+- **JSON 解析工具**：[`safe_json_parse()`](main.py) 安全地将字符串解析为 JSON，包含异常处理
+- **流式处理**：自动检测流式响应并使用 `web.StreamResponse` 实时转发，同时缓冲完整内容用于日志
 - **日志记录**：[`setup_logger()`](main.py) 配置 JSON 格式的日志记录器
 
 ### 添加新功能
@@ -639,6 +692,46 @@ llm-generate-proxy/
 2. **自定义日志格式**：修改 `setup_logger()` 函数
 3. **添加中间件**：在 `handle_request()` 中添加预处理逻辑
 4. **性能优化**：考虑连接池、缓存等机制
+5. **扩展流式适配器**：
+
+如果您需要支持新的 AI 平台流式响应格式，可以创建自定义适配器：
+
+```python
+class YourPlatformAdapter(StreamAdapter):
+    """自定义平台适配器"""
+    
+    def can_handle(self, first_chunk: str) -> bool:
+        """判断是否能处理该格式"""
+        try:
+            data = json.loads(first_chunk)
+            return "your_platform_field" in data
+        except:
+            return False
+    
+    def parse_chunk(self, line: str) -> Optional[StreamChunk]:
+        """解析单个数据块"""
+        if not line:
+            return None
+        
+        try:
+            data = json.loads(line)
+            chunk = StreamChunk()
+            
+            # 解析您的平台格式
+            chunk.content = data.get("content", "")
+            chunk.tool_calls = data.get("tool_calls", [])
+            # ... 其他字段解析
+            
+            return chunk
+        except:
+            return None
+
+# 注册适配器
+AdapterRegistry._adapters.insert(
+    -1,  # 在 GenericAdapter 之前插入
+    YourPlatformAdapter()
+)
+```
 
 ### 贡献指南
 

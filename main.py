@@ -8,7 +8,9 @@ import json
 import logging
 import time
 import argparse
-from typing import Optional, Dict, Any
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field
 from aiohttp import web, ClientSession, ClientTimeout, ClientError
 
 # ==================== 配置区域 ====================
@@ -22,7 +24,7 @@ API_MAPPING = {
     "dashscope-anthropic": "https://dashscope.aliyuncs.com/apps/anthropic",
 }
 
-DEFAULT_PORT = 8080
+DEFAULT_PORT = 8881
 LOG_FILE = "proxy_requests.log"
 REQUEST_TIMEOUT = 300
 
@@ -54,6 +56,15 @@ logger: Optional[logging.Logger] = None
 
 # ==================== 工具函数 ====================
 
+def safe_json_parse(value: str) -> Any:
+    """安全地将字符串解析为JSON，如果解析失败则返回原字符串"""
+    if not value or not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return value
+
 def extract_path_prefix(path: str) -> tuple[str, str]:
     """从路径中提取前缀和剩余路径"""
     parts = path.strip("/").split("/", 1)
@@ -76,6 +87,306 @@ def build_upstream_url(prefix: str, remaining_path: str, query_string: str) -> O
         upstream_url += "?" + query_string
     
     return upstream_url
+
+# ==================== 流式响应适配器 ====================
+
+@dataclass
+class StreamChunk:
+    """统一的流式响应块结构"""
+    content: str = ""
+    reasoning_content: str = ""
+    tool_calls: List[Dict[str, Any]] = field(default_factory=list)
+    finish_reason: Optional[str] = None
+    usage: Optional[Dict[str, Any]] = None
+
+class StreamAdapter(ABC):
+    """流式响应适配器基类"""
+    
+    @abstractmethod
+    def parse_chunk(self, line: str) -> Optional[StreamChunk]:
+        """解析单个数据块"""
+        pass
+    
+    @abstractmethod
+    def can_handle(self, first_chunk: str) -> bool:
+        """判断是否能处理该格式的数据"""
+        pass
+    
+    def aggregate(self, chunks: List[StreamChunk]) -> Dict[str, Any]:
+        """聚合所有块，返回统一格式"""
+        content_parts = []
+        reasoning_parts = []
+        all_tool_calls = []
+        finish_reason = None
+        usage = None
+        
+        for chunk in chunks:
+            if chunk.content:
+                content_parts.append(chunk.content)
+            if chunk.reasoning_content:
+                reasoning_parts.append(chunk.reasoning_content)
+            if chunk.tool_calls:
+                all_tool_calls.extend(chunk.tool_calls)
+            if chunk.finish_reason:
+                finish_reason = chunk.finish_reason
+            if chunk.usage:
+                usage = chunk.usage
+        
+        merged_tool_calls = self._merge_tool_calls(all_tool_calls)
+        
+        return {
+            "content": "".join(content_parts),
+            "reasoning_content": "".join(reasoning_parts),
+            "tool_calls": merged_tool_calls,
+            "finish_reason": finish_reason,
+            "usage": usage
+        }
+    
+    def _merge_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """合并相同 index 的 tool_calls"""
+        if not tool_calls:
+            return []
+        
+        merged = {}
+        for tc in tool_calls:
+            index = tc.get("index", 0)
+            if index not in merged:
+                merged[index] = {
+                    "index": index,
+                    "id": tc.get("id", ""),
+                    "type": tc.get("type", "function"),
+                    "function": {
+                        "name": "",
+                        "arguments": ""
+                    }
+                }
+            
+            if "function" in tc:
+                if "name" in tc["function"] and tc["function"]["name"]:
+                    merged[index]["function"]["name"] = tc["function"]["name"]
+                if "arguments" in tc["function"] and tc["function"]["arguments"]:
+                    merged[index]["function"]["arguments"] += tc["function"]["arguments"]
+        
+        # 对 arguments 进行 JSON 解析
+        for item in merged.values():
+            if "function" in item and "arguments" in item["function"]:
+                item["function"]["arguments"] = safe_json_parse(item["function"]["arguments"])
+        
+        return sorted(merged.values(), key=lambda x: x["index"])
+
+class OpenAIAdapter(StreamAdapter):
+    """OpenAI 格式适配器"""
+    
+    def can_handle(self, first_chunk: str) -> bool:
+        try:
+            data = json.loads(first_chunk)
+            return "choices" in data or "model" in data
+        except:
+            return False
+    
+    def parse_chunk(self, line: str) -> Optional[StreamChunk]:
+        if not line or line.strip() == "[DONE]":
+            return None
+        
+        try:
+            data = json.loads(line)
+            chunk = StreamChunk()
+            
+            if "choices" in data and len(data["choices"]) > 0:
+                choice = data["choices"][0]
+                chunk.finish_reason = choice.get("finish_reason")
+                
+                delta = choice.get("delta", {})
+                chunk.content = delta.get("content", "")
+                
+                if "reasoning_content" in delta:
+                    chunk.reasoning_content = delta.get("reasoning_content", "")
+                
+                if "tool_calls" in delta:
+                    chunk.tool_calls = delta["tool_calls"]
+                
+                if "usage" in data:
+                    chunk.usage = data["usage"]
+            
+            return chunk
+        except:
+            return None
+
+class AnthropicAdapter(StreamAdapter):
+    """Anthropic 格式适配器"""
+    
+    def can_handle(self, first_chunk: str) -> bool:
+        try:
+            data = json.loads(first_chunk)
+            return "type" in data and data["type"] in ["message_start", "content_block_start", "ping"]
+        except:
+            return False
+    
+    def parse_chunk(self, line: str) -> Optional[StreamChunk]:
+        if not line:
+            return None
+        
+        try:
+            data = json.loads(line)
+            chunk = StreamChunk()
+            event_type = data.get("type", "")
+            
+            if event_type == "content_block_start":
+                content_block = data.get("content_block", {})
+                block_type = content_block.get("type", "")
+                
+                # 解析 tool_use 开始
+                if block_type == "tool_use":
+                    chunk.tool_calls = [{
+                        "index": data.get("index", 0),
+                        "id": content_block.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": content_block.get("name", ""),
+                            "arguments": ""
+                        }
+                    }]
+            
+            elif event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                delta_type = delta.get("type", "")
+                
+                if delta_type == "text_delta":
+                    chunk.content = delta.get("text", "")
+                elif delta_type == "thinking_delta":
+                    chunk.reasoning_content = delta.get("thinking", "")
+                # 解析 tool_use 的参数增量
+                elif delta_type == "input_json_delta":
+                    partial_json = delta.get("partial_json", "")
+                    chunk.tool_calls = [{
+                        "index": data.get("index", 0),
+                        "function": {
+                            "arguments": partial_json
+                        }
+                    }]
+            
+            elif event_type == "message_delta":
+                delta = data.get("delta", {})
+                chunk.finish_reason = delta.get("stop_reason")
+                
+                if "usage" in data:
+                    chunk.usage = data.get("usage")
+            
+            return chunk
+        except:
+            return None
+
+class GenericAdapter(StreamAdapter):
+    """通用适配器 - 用于未知格式"""
+    
+    def can_handle(self, first_chunk: str) -> bool:
+        return True
+    
+    def parse_chunk(self, line: str) -> Optional[StreamChunk]:
+        if not line:
+            return None
+        
+        chunk = StreamChunk()
+        try:
+            data = json.loads(line)
+            chunk.content = data.get("content", data.get("text", data.get("delta", "")))
+            chunk.reasoning_content = data.get("reasoning_content", data.get("reasoning", ""))
+            chunk.tool_calls = data.get("tool_calls", [])
+            chunk.finish_reason = data.get("finish_reason")
+            chunk.usage = data.get("usage")
+        except:
+            chunk.content = line
+        
+        return chunk
+
+class AdapterRegistry:
+    """适配器注册表"""
+    
+    _adapters: List[StreamAdapter] = [
+        OpenAIAdapter(),
+        AnthropicAdapter(),
+        GenericAdapter(),
+    ]
+    
+    @classmethod
+    def get_adapter(cls, first_chunk: str) -> StreamAdapter:
+        """获取合适的适配器"""
+        for adapter in cls._adapters:
+            if adapter.can_handle(first_chunk):
+                return adapter
+        return cls._adapters[-1]
+
+class StreamingLogPipeline:
+    """流式响应日志管道"""
+    
+    def __init__(self, path: str):
+        self.path = path
+        self.adapter: Optional[StreamAdapter] = None
+        self.chunks: List[StreamChunk] = []
+        self.start_time = time.time()
+        self.first_token_time: Optional[float] = None
+        self.is_initialized = False
+        self.event_type = "message"
+    
+    def process_line(self, line: str):
+        """处理 SSE 数据行"""
+        line = line.rstrip('\n')
+        
+        if not self.is_initialized and line.startswith("data: "):
+            first_data = line[6:]
+            if first_data and first_data != "[DONE]":
+                self.adapter = AdapterRegistry.get_adapter(first_data)
+                self.is_initialized = True
+        
+        if line.startswith("event: "):
+            self.event_type = line[7:]
+        elif line.startswith("data: "):
+            data = line[6:]
+            if data and data != "[DONE]":
+                if self.first_token_time is None:
+                    self.first_token_time = time.time()
+                
+                if self.adapter:
+                    chunk = self.adapter.parse_chunk(data)
+                    if chunk:
+                        self.chunks.append(chunk)
+        elif line.startswith(":"):
+            pass
+        elif line == "":
+            self.event_type = "message"
+    
+    def finalize(self) -> Dict[str, Any]:
+        """完成处理并生成统一格式的日志"""
+        completion_time = time.time()
+        elapsed = completion_time - self.start_time
+        ttft = self.first_token_time - self.start_time if self.first_token_time else None
+        
+        if self.adapter and self.chunks:
+            aggregated_body = self.adapter.aggregate(self.chunks)
+        else:
+            aggregated_body = {
+                "content": "",
+                "reasoning_content": "",
+                "tool_calls": [],
+                "finish_reason": None,
+                "usage": None
+            }
+        
+        response_body = {
+            "content": aggregated_body.get("content", ""),
+            "reasoning_content": aggregated_body.get("reasoning_content", ""),
+            "tool_calls": aggregated_body.get("tool_calls", []),
+            "finish_reason": aggregated_body.get("finish_reason"),
+            "usage": aggregated_body.get("usage"),
+            "_meta": {
+                "total_chunks": len(self.chunks),
+                "first_token_seconds": round(ttft, 3) if ttft else None,
+                "total_seconds": round(elapsed, 3),
+                "content_length": len(aggregated_body.get("content", "")),
+            }
+        }
+        
+        return response_body
 
 # ==================== 请求处理 ====================
 
@@ -106,6 +417,9 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
     except Exception:
         body = b""
     
+    # 预解析请求体用于日志
+    request_body_log = safe_json_parse(body.decode("utf-8", errors="replace")) if body else ""
+    
     # 复制请求头
     headers = {k: v for k, v in request.headers.items()}
     headers.pop("Host", None)
@@ -124,8 +438,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 content_type = upstream_resp.headers.get('Content-Type', '').lower()
                 is_streaming = (
                     'text/event-stream' in content_type or 
-                    'stream' in content_type or 
-                    request.path.endswith('/chat/completions')  # 假设 chat 接口可能是流式的
+                    'stream' in content_type
                 )
                 
                 if is_streaming:
@@ -141,14 +454,23 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         headers=resp_headers,
                     )
                     
+                    # 创建日志管道用于聚合流式数据（在 try 块外初始化以避免作用域问题）
+                    log_pipeline = StreamingLogPipeline(original_path)
+                    
                     try:
                         await resp.prepare(request)
                         
-                        # 缓冲区收集完整响应用于日志
-                        full_response_buffer = bytearray()
+                        # 缓冲区收集原始数据用于转发
+                        raw_buffer = bytearray()
                         
                         async for chunk, _ in upstream_resp.content.iter_chunks():
-                            full_response_buffer.extend(chunk)
+                            raw_buffer.extend(chunk)
+                            
+                            # 解析 chunk 中的 SSE 事件行
+                            chunk_text = chunk.decode('utf-8', errors='replace')
+                            for line in chunk_text.split('\n'):
+                                log_pipeline.process_line(line)
+                            
                             try:
                                 await resp.write(chunk)
                             except (ConnectionResetError, BrokenPipeError, ConnectionError) as write_err:
@@ -165,7 +487,10 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                         
                         elapsed = time.time() - start_time
                         
-                        # 记录完整日志（流式响应）
+                        # 生成聚合后的结构化日志
+                        aggregated_log = log_pipeline.finalize()
+                        
+                        # 记录完整日志（流式响应 - 聚合版本）
                         log_entry = {
                             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                             "request": {
@@ -173,13 +498,14 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                 "path": original_path,
                                 "upstream_url": upstream_url,
                                 "headers": dict(headers),
-                                "body": body.decode("utf-8", errors="replace") if body else ""
+                                "body": safe_json_parse(body.decode("utf-8", errors="replace")) if body else ""
                             },
                             "response": {
                                 "status_code": upstream_resp.status,
                                 "elapsed_seconds": round(elapsed, 3),
-                                "headers": dict(upstream_resp.headers),
-                                "body": bytes(full_response_buffer).decode("utf-8", errors="replace"),
+                                "headers": {k: v for k, v in upstream_resp.headers.items() 
+                                           if k.lower() not in ("transfer-encoding", "connection", "keep-alive")},
+                                "body": aggregated_log,
                                 "is_streaming": True
                             }
                         }
@@ -192,6 +518,10 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                     except (ConnectionResetError, BrokenPipeError, ConnectionError) as e:
                         # 准备响应时就失败（连接已关闭）
                         elapsed = time.time() - start_time
+                        
+                        # 即使连接失败，也要生成已有的聚合日志
+                        aggregated_log = log_pipeline.finalize() if log_pipeline else None
+                        
                         if logger:
                             logger.warning(f"流式响应连接失败: {e}")
                         
@@ -202,12 +532,13 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                                 "path": original_path,
                                 "upstream_url": upstream_url,
                                 "headers": dict(headers),
-                                "body": body.decode("utf-8", errors="replace") if body else ""
+                                "body": safe_json_parse(body.decode("utf-8", errors="replace")) if body else ""
                             },
                             "response": {
                                 "status_code": upstream_resp.status,
                                 "elapsed_seconds": round(elapsed, 3),
                                 "error": f"Client connection closed: {str(e)}",
+                                "body": aggregated_log,
                                 "is_streaming": True
                             }
                         }
@@ -249,13 +580,13 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                             "path": original_path,
                             "upstream_url": upstream_url,
                             "headers": dict(headers),
-                            "body": body.decode("utf-8", errors="replace") if body else ""
+                            "body": safe_json_parse(body.decode("utf-8", errors="replace")) if body else ""
                         },
                         "response": {
                             "status_code": upstream_resp.status,
                             "elapsed_seconds": round(elapsed, 3),
                             "headers": dict(upstream_resp.headers),
-                            "body": resp_body.decode("utf-8", errors="replace") if resp_body else "",
+                            "body": safe_json_parse(resp_body.decode("utf-8", errors="replace")) if resp_body else "",
                             "is_streaming": False
                         }
                     }
@@ -280,7 +611,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 "path": original_path,
                 "upstream_url": upstream_url,
                 "headers": dict(headers),
-                "body": body.decode("utf-8", errors="replace") if body else ""
+                "body": safe_json_parse(body.decode("utf-8", errors="replace")) if body else ""
             },
             "response": {
                 "status_code": 502,
@@ -312,7 +643,7 @@ async def handle_request(request: web.Request) -> web.StreamResponse:
                 "path": original_path,
                 "upstream_url": upstream_url,
                 "headers": dict(headers),
-                "body": body.decode("utf-8", errors="replace") if body else ""
+                "body": safe_json_parse(body.decode("utf-8", errors="replace")) if body else ""
             },
             "response": {
                 "status_code": 500,
