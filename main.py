@@ -26,7 +26,7 @@ API_MAPPING = {
 
 DEFAULT_PORT = 8881
 LOG_FILE = "proxy_requests.log"
-REQUEST_TIMEOUT = 300
+REQUEST_TIMEOUT = 3000
 
 # ==================== 日志配置 ====================
 
@@ -187,27 +187,38 @@ class OpenAIAdapter(StreamAdapter):
     def parse_chunk(self, line: str) -> Optional[StreamChunk]:
         if not line or line.strip() == "[DONE]":
             return None
-        
+
         try:
             data = json.loads(line)
             chunk = StreamChunk()
-            
+
+            # usage 可能出现在最终不含 choices 的块中 (stream_options.include_usage)
+            if "usage" in data:
+                chunk.usage = data["usage"]
+
             if "choices" in data and len(data["choices"]) > 0:
                 choice = data["choices"][0]
                 chunk.finish_reason = choice.get("finish_reason")
-                
+
                 delta = choice.get("delta", {})
                 chunk.content = delta.get("content", "")
-                
-                if "reasoning_content" in delta:
-                    chunk.reasoning_content = delta.get("reasoning_content", "")
-                
+
+                # 兼容不同厂商的 reasoning 字段名和位置
+                # - OpenAI: delta.reasoning_content
+                # - DeepSeek: delta.reasoning_content 或 choice.reasoning_content
+                # - Sensenova: delta.reasoning 或 choice.reasoning
+                reasoning = (
+                    delta.get("reasoning_content")
+                    or delta.get("reasoning")
+                    or choice.get("reasoning_content")
+                    or choice.get("reasoning")
+                )
+                if reasoning:
+                    chunk.reasoning_content = reasoning
+
                 if "tool_calls" in delta:
                     chunk.tool_calls = delta["tool_calls"]
-                
-                if "usage" in data:
-                    chunk.usage = data["usage"]
-            
+
             return chunk
         except:
             return None
